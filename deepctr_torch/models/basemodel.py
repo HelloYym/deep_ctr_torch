@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as Data
+from torch.autograd import Variable
+
 from sklearn.metrics import *
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -33,20 +35,13 @@ class Linear(nn.Module):
         self.dense_feature_columns = list(
             filter(lambda x: isinstance(x, DenseFeat), feature_columns)) if len(feature_columns) else []
 
-        self.embedding_dict = self.create_embedding_matrix(self.sparse_feature_columns, 1, init_std, sparse=False).to(
-            device)
+        self.embedding_dict = self.create_embedding_matrix(self.sparse_feature_columns, 1, init_std, sparse=False)
 
-        #         nn.ModuleDict(
-        #             {feat.embedding_name: nn.Embedding(feat.dimension, 1, sparse=True) for feat in
-        #              self.sparse_feature_columns}
-        #         )
-        # .to("cuda:1")
         for tensor in self.embedding_dict.values():
             nn.init.normal_(tensor.weight, mean=0, std=init_std)
 
         if len(self.dense_feature_columns) > 0:
-            self.weight = nn.Parameter(torch.Tensor(sum(fc.dimension for fc in self.dense_feature_columns), 1)).to(
-                device)
+            self.weight = nn.Parameter(torch.Tensor(sum(fc.dimension for fc in self.dense_feature_columns), 1))
             torch.nn.init.normal_(self.weight, mean=0, std=init_std)
 
     def forward(self, X):
@@ -90,16 +85,13 @@ class Linear(nn.Module):
 
 
 class BaseModel(nn.Module):
-
     def __init__(self,
-                 linear_feature_columns, dnn_feature_columns, embedding_size=8, dnn_hidden_units=(128, 128),
-                 l2_reg_linear=1e-5,
-                 l2_reg_embedding=1e-5, l2_reg_dnn=0, init_std=0.0001, seed=1024, dnn_dropout=0, dnn_activation='relu',
+                 linear_feature_columns, dnn_feature_columns, embedding_size=8,
+                 l2_reg_embedding=1e-5, init_std=0.0001,
                  task='binary', device='cpu'):
 
         super(BaseModel, self).__init__()
 
-        self.reg_loss = torch.zeros((1,), device=device)
         self.device = device  # device
 
         self.feature_index = build_input_features(
@@ -107,31 +99,38 @@ class BaseModel(nn.Module):
         self.dnn_feature_columns = dnn_feature_columns
 
         self.embedding_dict = self.create_embedding_matrix(dnn_feature_columns, embedding_size, init_std,
-                                                           sparse=False).to(device)
-        #         nn.ModuleDict(
-        #             {feat.embedding_name: nn.Embedding(feat.dimension, embedding_size, sparse=True) for feat in
-        #              self.dnn_feature_columns}
-        #         )
+                                                           sparse=False)
 
-        self.linear_model = Linear(
-            linear_feature_columns, self.feature_index, device=device)
-
-        self.add_regularization_loss(
-            self.embedding_dict.parameters(), l2_reg_embedding)
-        self.add_regularization_loss(
-            self.linear_model.parameters(), l2_reg_linear)
+        self.l2_reg_embedding = l2_reg_embedding
 
         self.out = PredictionLayer(task, )
-        self.to(device)
+
+    def get_loss(self, y, y_pred):
+
+        loss = F.binary_cross_entropy(y_pred, y.squeeze())
+
+        embedding_loss = self.get_regularization_loss(
+            self.embedding_dict.parameters(), self.l2_reg_embedding)
+
+        return loss + embedding_loss
+
+    def reduce_lr(self, optimizer, epoch, factor=0.1, change_points=None):
+
+        if change_points is not None and epoch in change_points:
+            for g in optimizer.param_groups:
+                g['lr'] = g['lr'] * factor
+                print(epoch, ": {0: .4f}".format(g['lr']))
+            return True
 
     def fit(self, x=None,
             y=None,
-            batch_size=None,
+            batch_size=4096,
             epochs=1,
             verbose=1,
             initial_epoch=0,
             validation_split=0.,
             validation_data=None,
+            metrics=None,
             shuffle=True, ):
         """
 
@@ -147,12 +146,12 @@ class BaseModel(nn.Module):
         :param shuffle: Boolean. Whether to shuffle the order of the batches at the beginning of each epoch.
 
         """
-        if isinstance(x,dict):
+        if isinstance(x, dict):
             x = [x[feature] for feature in self.feature_index]
+
         if validation_data:
             if len(validation_data) == 2:
                 val_x, val_y = validation_data
-                val_sample_weight = None
             elif len(validation_data) == 3:
                 val_x, val_y, val_sample_weight = validation_data  # pylint: disable=unpacking-non-sequence
             else:
@@ -166,19 +165,20 @@ class BaseModel(nn.Module):
             if isinstance(val_x, dict):
                 val_x = [val_x[feature] for feature in self.feature_index]
 
-        elif validation_split and 0. < validation_split < 1.:
-            if hasattr(x[0], 'shape'):
-                split_at = int(x[0].shape[0] * (1. - validation_split))
-            else:
-                split_at = int(len(x[0]) * (1. - validation_split))
-            x, val_x = (slice_arrays(x, 0, split_at),
-                        slice_arrays(x, split_at))
-            y, val_y = (slice_arrays(y, 0, split_at),
-                        slice_arrays(y, split_at))
+        # elif validation_split and 0. < validation_split < 1.:
+        #     if hasattr(x[0], 'shape'):
+        #         split_at = int(x[0].shape[0] * (1. - validation_split))
+        #     else:
+        #         split_at = int(len(x[0]) * (1. - validation_split))
+        #     x, val_x = (slice_arrays(x, 0, split_at),
+        #                 slice_arrays(x, split_at))
+        #     y, val_y = (slice_arrays(y, 0, split_at),
+        #                 slice_arrays(y, split_at))
 
         else:
             val_x = []
             val_y = []
+
         for i in range(len(x)):
             if len(x[i].shape) == 1:
                 x[i] = np.expand_dims(x[i], axis=1)
@@ -187,77 +187,92 @@ class BaseModel(nn.Module):
             torch.from_numpy(
                 np.concatenate(x, axis=-1)),
             torch.from_numpy(y))
-        if batch_size is None:
-            batch_size = 256
-        train_loader = DataLoader(
-            dataset=train_tensor_data, shuffle=shuffle, batch_size=batch_size)
 
-        print(self.device, end="\n")
-        model = self.train()
-        loss_func = self.loss_func
-        optim = self.optim
+        if isinstance(val_x, dict):
+            val_x = [val_x[feature] for feature in self.feature_index]
+
+        for i in range(len(val_x)):
+            if len(val_x[i].shape) == 1:
+                val_x[i] = np.expand_dims(val_x[i], axis=1)
+
+        val_tensor_data = Data.TensorDataset(torch.from_numpy(np.concatenate(val_x, axis=-1)), torch.from_numpy(val_y))
+
+        train_loader = DataLoader(dataset=train_tensor_data, shuffle=False, batch_size=batch_size,
+                                  num_workers=8, pin_memory=False)
+
+        val_loader = DataLoader(dataset=val_tensor_data, shuffle=False, batch_size=batch_size,
+                                num_workers=8, pin_memory=False)
+
+        model = self.cuda(self.device)
+        model = nn.DataParallel(model, device_ids=[i for i in range(int(self.device.split(':')[1]), 8)])
+
+        # 定义 优化方法
+        optim = torch.optim.Adam(model.parameters(), lr=0.04)
+        # optim = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        metrics = self._get_metrics(metrics)
 
         sample_num = len(train_tensor_data)
         steps_per_epoch = (sample_num - 1) // batch_size + 1
 
         print("Train on {0} samples, validate on {1} samples, {2} steps per epoch".format(
-            len(train_tensor_data), len(val_y),steps_per_epoch))
+            len(train_tensor_data), len(val_y), steps_per_epoch))
+
         for epoch in range(initial_epoch, epochs):
             start_time = time.time()
-            loss_epoch = 0
             total_loss_epoch = 0
-            # if abs(loss_last - loss_now) < 0.0
             train_result = {}
-            try:
-                with tqdm(enumerate(train_loader), disable=verbose != 1) as t:
-                    for index, (x_train, y_train) in t:
-                        x = x_train.to(self.device).float()
-                        y = y_train.to(self.device).float()
 
-                        y_pred = model(x).squeeze()
+            change_points = [10, 20, 30, 40, 50]
+            self.reduce_lr(optim, epoch, factor=0.5, change_points=change_points)
 
-                        optim.zero_grad()
-                        loss = loss_func(y_pred, y.squeeze(), reduction='sum')
+            model.train()
 
-                        total_loss = loss + self.reg_loss
+            for index, (x_train, y_train) in enumerate(train_loader):
 
-                        loss_epoch += loss.item()
-                        total_loss_epoch += total_loss.item()
-                        total_loss.backward(retain_graph=True)
-                        optim.step()
+                x = Variable(x_train.cuda(self.device).float())
+                y = Variable(y_train.cuda(self.device).float())
 
-                        if verbose > 0:
-                            for name, metric_fun in self.metrics.items():
-                                if name not in train_result:
-                                    train_result[name] = []
-                                train_result[name].append(metric_fun(
-                                    y.cpu().data.numpy(), y_pred.cpu().data.numpy()))
+                y_pred = model(x).squeeze()
 
-            except KeyboardInterrupt:
-                t.close()
-                raise
-            t.close()
+                optim.zero_grad()
+                total_loss = self.get_loss(y, y_pred)
+
+                total_loss_epoch += total_loss.item()
+                total_loss.backward(retain_graph=True)
+                optim.step()
+
+                if verbose > 0 and epoch % verbose == 0:
+                    for name, metric_fun in metrics.items():
+                        if name not in train_result:
+                            train_result[name] = []
+                        train_result[name].append(metric_fun(y.cpu().data.numpy(), y_pred.cpu().data.numpy()))
 
             epoch_time = int(time.time() - start_time)
-            if verbose > 0:
-                print('Epoch {0}/{1}'.format(epoch + 1, epochs))
 
+            if verbose > 0 and epoch % verbose == 0:
+
+                model.eval()
+
+                print('Epoch {0}/{1}'.format(epoch, epochs))
+
+                # loss 与 metric 的区别，loss 包含 logloss 和 regloss
                 eval_str = "{0}s - loss: {1: .4f}".format(
-                    epoch_time, total_loss_epoch / sample_num)
+                    epoch_time, total_loss_epoch / steps_per_epoch)
 
                 for name, result in train_result.items():
                     eval_str += " - " + name + \
-                        ": {0: .4f}".format(np.sum(result) / steps_per_epoch)
+                                ": {0: .4f}".format(np.sum(result) / steps_per_epoch)
 
                 if len(val_x) and len(val_y):
-                    eval_result = self.evaluate(val_x, val_y, batch_size)
+                    eval_result = self.evaluate(model, val_loader, metrics)
 
                     for name, result in eval_result.items():
                         eval_str += " - val_" + name + \
-                            ": {0: .4f}".format(result)
+                                    ": {0: .4f}".format(result)
                 print(eval_str)
 
-    def evaluate(self, x, y, batch_size=256):
+    def evaluate(self, model, val_loader, metrics):
         """
 
         :param x: Numpy array of test data (if the model has a single input), or list of Numpy arrays (if the model has multiple inputs).
@@ -265,13 +280,29 @@ class BaseModel(nn.Module):
         :param batch_size:
         :return: Integer or `None`. Number of samples per evaluation step. If unspecified, `batch_size` will default to 256.
         """
-        pred_ans = self.predict(x, batch_size)
+
+        pred_ans = []
         eval_result = {}
-        for name, metric_fun in self.metrics.items():
-            eval_result[name] = metric_fun(y, pred_ans)
+
+        with torch.no_grad():
+            for index, (x_test, y_test) in enumerate(val_loader):
+                x = Variable(x_test.cuda(self.device).float())
+                y = Variable(y_test.cuda(self.device).float())
+
+                y_pred = model(x)
+                pred_ans.append(y_pred)
+
+                for name, metric_fun in metrics.items():
+                    if name not in eval_result:
+                        eval_result[name] = []
+                    eval_result[name].append(metric_fun(y.cpu().data.numpy(), y_pred.cpu().data.numpy()))
+
+        for key, eval_list in eval_result.items():
+            eval_result[key] = np.mean(eval_list)
+
         return eval_result
 
-    def predict(self, x, batch_size=256):
+    def predict(self, x, batch_size=4096):
         """
 
         :param x: The input data, as a Numpy array (or list of Numpy arrays if the model has multiple inputs).
@@ -279,25 +310,28 @@ class BaseModel(nn.Module):
         :return: Numpy array(s) of predictions.
         """
         model = self.eval()
+
         if isinstance(x, dict):
             x = [x[feature] for feature in self.feature_index]
+
         for i in range(len(x)):
             if len(x[i].shape) == 1:
                 x[i] = np.expand_dims(x[i], axis=1)
 
         tensor_data = Data.TensorDataset(
             torch.from_numpy(np.concatenate(x, axis=-1)))
-        test_loader = DataLoader(
-            dataset=tensor_data, shuffle=False, batch_size=batch_size)
+
+        test_loader = DataLoader(dataset=tensor_data, shuffle=False, batch_size=batch_size,
+                                 num_workers=16, pin_memory=False)
 
         pred_ans = []
         with torch.no_grad():
             for index, x_test in enumerate(test_loader):
-                x = x_test[0].to(self.device).float()
-                # y = y_test.to(self.device).float()
+                x = Variable(x_test[0].cuda(self.device).float())
 
                 y_pred = model(x).cpu().data.numpy()  # .squeeze()
                 pred_ans.append(y_pred)
+
         return np.concatenate(pred_ans)
 
     def input_from_feature_columns(self, X, feature_columns, embedding_dict, support_dense=True):
@@ -317,9 +351,11 @@ class BaseModel(nn.Module):
         sparse_embedding_list = [embedding_dict[feat.embedding_name](
             X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]].long()) for
             feat in sparse_feature_columns]
+
         varlen_sparse_embedding_list = [embedding_dict[feat.embedding_name](
             X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]].long()) for
             feat in varlen_sparse_feature_columns]
+
         varlen_sparse_embedding_list = list(
             map(lambda x: x.unsqueeze(dim=1), varlen_sparse_embedding_list))
 
@@ -350,9 +386,11 @@ class BaseModel(nn.Module):
 
         return embedding_dict
 
-    def compute_input_dim(self, feature_columns, embedding_size=1, include_sparse=True, include_dense=True, feature_group=False):
+    def compute_input_dim(self, feature_columns, embedding_size=1, include_sparse=True, include_dense=True,
+                          feature_group=False):
         sparse_feature_columns = list(
-            filter(lambda x: isinstance(x, (SparseFeat, VarLenSparseFeat)), feature_columns)) if len(feature_columns) else []
+            filter(lambda x: isinstance(x, (SparseFeat, VarLenSparseFeat)), feature_columns)) if len(
+            feature_columns) else []
         dense_feature_columns = list(
             filter(lambda x: isinstance(x, DenseFeat), feature_columns)) if len(feature_columns) else []
 
@@ -369,60 +407,17 @@ class BaseModel(nn.Module):
             input_dim += dense_input_dim
         return input_dim
 
-    def add_regularization_loss(self, weight_list, weight_decay, p=2):
-        reg_loss = torch.zeros((1,), device=self.device)
+    def get_regularization_loss(self, weight_list, weight_decay, p=2):
+        reg_loss = torch.zeros((1,)).cuda(self.device)
         for w in weight_list:
             if isinstance(w, tuple):
                 l2_reg = torch.norm(w[1], p=p, )
             else:
                 l2_reg = torch.norm(w, p=p, )
-            reg_loss = reg_loss + l2_reg
+            reg_loss = reg_loss + l2_reg.cuda(self.device)
         reg_loss = weight_decay * reg_loss
-        self.reg_loss += reg_loss
 
-    def compile(self, optimizer,
-                loss=None,
-                metrics=None,
-                ):
-        """
-        :param optimizer: String (name of optimizer) or optimizer instance. See [optimizers](https://pytorch.org/docs/stable/optim.html).
-        :param loss: String (name of objective function) or objective function. See [losses](https://pytorch.org/docs/stable/nn.functional.html#loss-functions).
-        :param metrics: List of metrics to be evaluated by the model during training and testing. Typically you will use `metrics=['accuracy']`.
-        """
-
-        self.optim = self._get_optim(optimizer)
-        self.loss_func = self._get_loss_func(loss)
-        self.metrics = self._get_metrics(metrics)
-
-    def _get_optim(self, optimizer):
-        if isinstance(optimizer, str):
-            if optimizer == "sgd":
-                optim = torch.optim.SGD(self.parameters(), lr=0.01)
-            elif optimizer == "adam":
-                optim = torch.optim.Adam(self.parameters())  # 0.001
-            elif optimizer == "adagrad":
-                optim = torch.optim.Adagrad(self.parameters())  # 0.01
-            elif optimizer == "rmsprop":
-                optim = torch.optim.RMSprop(self.parameters())
-            else:
-                raise NotImplementedError
-        else:
-            optim = optimizer
-        return optim
-
-    def _get_loss_func(self, loss):
-        if isinstance(loss, str):
-            if loss == "binary_crossentropy":
-                loss_func = F.binary_cross_entropy
-            elif loss == "mse":
-                loss_func = F.mse_loss
-            elif loss == "mae":
-                loss_func = F.l1_loss
-            else:
-                raise NotImplementedError
-        else:
-            loss_func = loss
-        return loss_func
+        return reg_loss
 
     def _get_metrics(self, metrics):
         metrics_ = {}

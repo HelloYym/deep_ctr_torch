@@ -53,8 +53,6 @@ class DNN(nn.Module):
             if 'weight' in name:
                 nn.init.normal_(tensor, mean=0, std=init_std)
 
-        self.to(device)
-
     def forward(self, inputs):
         deep_input = inputs
 

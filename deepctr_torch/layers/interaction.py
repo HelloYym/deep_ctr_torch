@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from ..layers.core import Conv2dSame
 from ..layers.sequence import KMaxPooling
 
+import random
+import numpy as np
+
 
 class FM(nn.Module):
     """Factorization Machine models pairwise (order-2) feature interactions
@@ -170,7 +173,8 @@ class CIN(nn.Module):
         - [Lian J, Zhou X, Zhang F, et al. xDeepFM: Combining Explicit and Implicit Feature Interactions for Recommender Systems[J]. arXiv preprint arXiv:1803.05170, 2018.] (https://arxiv.org/pdf/1803.05170.pdf)
     """
 
-    def __init__(self, field_size, layer_size=(128, 128), activation=F.relu, split_half=True, l2_reg=1e-5, seed=1024,
+    def __init__(self, field_size, layer_size=(128, 128), activation=F.relu,
+                 split_half=True, use_senet=False, l2_reg=1e-5, seed=1024,
                  device='cpu'):
         super(CIN, self).__init__()
         if len(layer_size) == 0:
@@ -178,18 +182,25 @@ class CIN(nn.Module):
                 "layer_size must be a list(tuple) of length greater than 1")
 
         self.layer_size = layer_size
+
+        # X0 的维度
         self.field_nums = [field_size]
         self.split_half = split_half
         self.activation = activation
         self.l2_reg = l2_reg
+        self.use_senet = use_senet
         self.seed = seed
 
         self.conv1ds = nn.ModuleList()
         for i, size in enumerate(self.layer_size):
+
+            # filter 大小 = m * Hk-1, 当前层有 size 个 filter
             self.conv1ds.append(
                 nn.Conv1d(self.field_nums[-1] * self.field_nums[0], size, 1))
 
+            # 记录每一层的 size 大小
             if self.split_half:
+                # split half 相当于 dropout ？
                 if i != len(self.layer_size) - 1 and size % 2 > 0:
                     raise ValueError(
                         "layer_size must be even number except for the last layer when split_half=True")
@@ -198,34 +209,52 @@ class CIN(nn.Module):
             else:
                 self.field_nums.append(size)
 
-        #         for tensor in self.conv1ds:
-        #             nn.init.normal_(tensor.weight, mean=0, std=init_std)
-        self.to(device)
+                #         for tensor in self.conv1ds:
+                #             nn.init.normal_(tensor.weight, mean=0, std=init_std)
+
+
+        if use_senet:
+            # print(sum(self.layer_size) // 10)
+            self.SE = SENETLayer(sum(self.layer_size), 10, seed, device)
+
 
     def forward(self, inputs):
         if len(inputs.shape) != 3:
             raise ValueError(
                 "Unexpected inputs dimensions %d, expect to be 3 dimensions" % (len(inputs.shape)))
+
         batch_size = inputs.shape[0]
+
+        # embedding 向量维度
         dim = inputs.shape[-1]
+
+        # 每层的 feature map
         hidden_nn_layers = [inputs]
+
+        # input 要不要放到 final result 中
         final_result = []
 
         for i, size in enumerate(self.layer_size):
+
             # x^(k-1) * x^0
             x = torch.einsum(
                 'bhd,bmd->bhmd', hidden_nn_layers[-1], hidden_nn_layers[0])
+
             # x.shape = (batch_size , hi * m, dim)
             x = x.reshape(
                 batch_size, hidden_nn_layers[-1].shape[1] * hidden_nn_layers[0].shape[1], dim)
+
+            # 用 filter 生成 feature map
             # x.shape = (batch_size , hi, dim)
             x = self.conv1ds[i](x)
 
+            # 添加激活函数
             if self.activation is None or self.activation == 'linear':
                 curr_out = x
             else:
                 curr_out = self.activation(x)
 
+            # 当前层 feature map 一半用来输出，一半用来下一层预测
             if self.split_half:
                 if i != len(self.layer_size) - 1:
                     next_hidden, direct_connect = torch.split(
@@ -240,10 +269,53 @@ class CIN(nn.Module):
             final_result.append(direct_connect)
             hidden_nn_layers.append(next_hidden)
 
+        self.hidden_nn_layers = hidden_nn_layers
+
+        # 在 feature map 维度，把每层的所有 feature map 进行拼接
+        # result shape : batch_size * n_feature_map * dim
         result = torch.cat(final_result, dim=1)
+
+        if self.use_senet:
+            result = self.SE(result)
+            # pass
+
+        # 把所有 feature map 进行 pooling
+        # result shape : batch_size * n_feature_map
         result = torch.sum(result, -1)
 
         return result
+
+    def calculate_cosineloss(self):
+
+        reg_loss = torch.zeros((1,)).cuda(self.device)
+
+        for maps in self.hidden_nn_layers:
+
+            batch_size = maps.size(0)
+            num_maps = maps.size(1)
+            channel_num = int(num_maps/2)
+            eps = 1e-8
+            random_seed = random.sample(range(num_maps), channel_num)
+            maps = maps[:, random_seed, :]
+            maps = maps[:, random_seed, :, :].view(batch_size, channel_num, -1)
+
+            # maps_max = maps.max(dim=2)[0].expand(maps.shape[-1], batch_size, channel_num).permute(1, 2, 0)
+            # maps = maps/maps_max
+
+            # X1 shape: batch_size * 1 * channel * dim
+            X1 = maps.unsqueeze(1)
+            # X1 shape: batch_size * channel * 1 * dim
+            X2 = maps.unsqueeze(2)
+
+            dot11, dot22, dot12 = (X1 * X1).sum(3), (X2 * X2).sum(3), (X1 * X2).sum(3)
+
+            # print(dot12)
+            dist = dot12 / (torch.sqrt(dot11 * dot22 + eps))
+
+            tri_tensor = ((torch.Tensor(np.triu(np.ones([channel_num, channel_num])) - np.diag([1]*channel_num))).expand(batch_size, channel_num, channel_num)).cuda()
+            dist_num = abs((tri_tensor*dist).sum(1).sum(1)).sum()/(batch_size*channel_num*(channel_num-1)/2)
+
+            return dist_num, random_seed
 
 
 class AFMLayer(nn.Module):
@@ -609,11 +681,11 @@ class ConvLayer(nn.Module):
             module_list.append(torch.nn.Tanh().to(self.device))
 
             # KMaxPooling, extract top_k, returns tensors values
-            module_list.append(KMaxPooling(k = min(k, filed_shape), axis = 2, device = self.device).to(self.device))
+            module_list.append(KMaxPooling(k=min(k, filed_shape), axis=2, device=self.device).to(self.device))
             filed_shape = min(k, filed_shape)
         self.conv_layer = nn.Sequential(*module_list)
         self.to(device)
         self.filed_shape = filed_shape
-    
+
     def forward(self, inputs):
         return self.conv_layer(inputs)
