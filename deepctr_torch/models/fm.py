@@ -14,7 +14,7 @@ from ..inputs import combined_dnn_input
 from ..layers import FM, DNN
 
 
-class DeepFM(BaseModel):
+class PureFM(BaseModel):
     """Instantiates the DeepFM Network architecture.
 
     :param linear_feature_columns: An iterable containing all the features used by linear part of the model.
@@ -35,46 +35,23 @@ class DeepFM(BaseModel):
     :return: A PyTorch model instance.
     
     """
-    def __init__(self,
-                 linear_feature_columns, dnn_feature_columns, embedding_size=8, use_fm=True,
-                 dnn_hidden_units=(256, 128),
-                 l2_reg_linear=0.00001, l2_reg_embedding=0.00001, l2_reg_dnn=0, init_std=0.0001, seed=1024,
-                 dnn_dropout=0,
-                 dnn_activation=F.relu, dnn_use_bn=False, task='binary', device='cpu'):
 
-        super(DeepFM, self).__init__(linear_feature_columns, dnn_feature_columns, embedding_size=embedding_size,
-                                     task=task, device=device)
-
-        self.use_fm = use_fm
-        self.use_dnn = len(dnn_feature_columns) > 0 and len(
-            dnn_hidden_units) > 0
-        if use_fm:
-            self.fm = FM()
-
-        if self.use_dnn:
-            self.dnn = DNN(self.compute_input_dim(dnn_feature_columns, embedding_size), dnn_hidden_units,
-                           activation=dnn_activation, dropout_rate=dnn_dropout, use_bn=dnn_use_bn, init_std=init_std, device=device)
-            self.dnn_linear = nn.Linear(
-                dnn_hidden_units[-1], 1, bias=False).to(device)
+    def __init__(self, linear_feature_columns,
+                 dnn_feature_columns, embedding_size=8,
+                 task='binary', device='cpu'):
+        super(PureFM, self).__init__(linear_feature_columns, dnn_feature_columns, embedding_size=embedding_size,
+                                 task=task, device=device)
+        self.fm = FM()
 
         self.to(device)
 
     def forward(self, X):
-
         sparse_embedding_list, dense_value_list = self.input_from_feature_columns(X, self.dnn_feature_columns,
-                                                                                  self.embedding_dict, vector_embedding_dict={})
+                                                                                  self.embedding_dict,
+                                                                                  vector_embedding_dict=self.vector_embedding_dict)
 
-        if self.use_fm and len(sparse_embedding_list) > 0:
-            fm_input = torch.cat(sparse_embedding_list, dim=1)
-            logit = self.fm(fm_input)
-
-        if self.use_dnn:
-
-            dnn_input = combined_dnn_input(
-                sparse_embedding_list, dense_value_list)
-            dnn_output = self.dnn(dnn_input)
-            dnn_logit = self.dnn_linear(dnn_output)
-            logit += dnn_logit
+        fm_input = torch.cat(sparse_embedding_list, dim=1)
+        logit = self.fm(fm_input)
 
         y_pred = self.out(logit)
 

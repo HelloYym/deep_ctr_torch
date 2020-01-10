@@ -7,12 +7,10 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 
 if __name__ == "__main__":
 
-    c = ['C' + str(i) for i in range(1, 27)]
-
     data = pd.read_csv('./data/sample_500w.csv')
     print(data.shape)
     print(data.head())
 
-    print(data[c].max(axis=0))
+    print(data.max(axis=0))
 
 

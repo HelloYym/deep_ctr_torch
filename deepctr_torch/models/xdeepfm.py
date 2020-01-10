@@ -12,7 +12,10 @@ import torch.nn.functional as F
 
 from .basemodel import BaseModel, Linear
 from ..inputs import combined_dnn_input
-from ..layers import DNN, CIN
+from ..layers import DNN, CIN, SENETLayer
+
+import random
+import numpy as np
 
 
 class xDeepFM(BaseModel):
@@ -42,103 +45,105 @@ class xDeepFM(BaseModel):
 
     def __init__(self, linear_feature_columns, dnn_feature_columns,
                  embedding_size=8,
-                 use_lr=True,
+                 use_lr=False,
                  dnn_hidden_units=(256, 256),
                  cin_layer_size=(256, 128,), cin_split_half=True, cin_activation=F.relu,
-                 use_senet=False, use_cosine_loss=False,
-                 l2_reg_linear=0.00001, l2_reg_embedding=0.00001, l2_reg_dnn=0, l2_reg_cin=0,
                  init_std=0.0001, seed=1024, dnn_dropout=0,
-                 dnn_activation=F.relu, dnn_use_bn=False, task='binary', device='cpu'):
+                 dnn_activation=F.relu, dnn_use_bn=True, task='binary', device='cpu'):
 
         super(xDeepFM, self).__init__(linear_feature_columns, dnn_feature_columns, embedding_size=embedding_size,
-                                      l2_reg_embedding=l2_reg_embedding, init_std=init_std,
+                                      init_std=init_std,
                                       task=task, device=device)
 
+        print('=====xDeepFM=====')
+
+        self.embedding_size = embedding_size
+
         self.use_lr = use_lr
-        self.l2_reg_linear = l2_reg_linear
 
         if self.use_lr:
-            self.linear_model = Linear(linear_feature_columns, self.feature_index, device=device)
+            self.linear_model = nn.Linear(self.compute_input_dim(dnn_feature_columns, embedding_size), 1, bias=False)
 
         self.dnn_hidden_units = dnn_hidden_units
-        self.l2_reg_dnn = l2_reg_dnn
         self.use_dnn = len(dnn_feature_columns) > 0 and len(dnn_hidden_units) > 0
         if self.use_dnn:
             self.dnn = DNN(self.compute_input_dim(dnn_feature_columns, embedding_size), dnn_hidden_units,
-                           activation=dnn_activation, l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
+                           activation=dnn_activation, dropout_rate=dnn_dropout, use_bn=dnn_use_bn,
                            init_std=init_std, device=device)
             self.dnn_linear = nn.Linear(dnn_hidden_units[-1], 1, bias=False)
 
         self.cin_layer_size = cin_layer_size
         self.use_cin = len(self.cin_layer_size) > 0 and len(dnn_feature_columns) > 0
 
-        self.use_senet = use_senet
-        self.use_cosine_loss = use_cosine_loss
-
         if self.use_cin:
-            field_num = len(self.embedding_dict)
-            if cin_split_half == True:
-                self.featuremap_num = sum(
-                    cin_layer_size[:-1]) // 2 + cin_layer_size[-1]
-            else:
-                self.featuremap_num = sum(cin_layer_size)
+
+            field_num = len(self.embedding_dict) + len(self.vector_embedding_dict)
+
+            self.featuremap_num = sum(cin_layer_size)
 
             self.cin = CIN(field_num, cin_layer_size,
-                           cin_activation, cin_split_half, use_senet, l2_reg_cin, seed, device=device)
-            self.cin_linear = nn.Linear(self.featuremap_num, 1, bias=False)
-            self.l2_reg_cin = l2_reg_cin
+                           cin_activation, cin_split_half, seed, device=device)
 
-    # override
-    def get_loss(self, y, y_pred):
+            self.cin_linear = nn.Linear(self.featuremap_num, 1, bias=True)
 
-        loss = super(xDeepFM, self).get_loss(y, y_pred)
+        self._initialize_weights(init_std)
 
-        if self.use_dnn:
-            loss += self.get_regularization_loss(
-                filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.dnn.named_parameters()), self.l2_reg_dnn)
-
-        if self.use_cin:
-            loss += self.get_regularization_loss(filter(lambda x: 'weight' in x[0], self.cin.named_parameters()),
-                                                 self.l2_reg_cin)
-            # if self.use_cosine_loss:
-            #     loss += self.cin.calculate_cosineloss()
-
-            # loss += self.get_regularization_loss(self.cin_linear.parameters(), self.l2_reg_linear)
-
-        if self.use_lr:
-            loss += self.get_regularization_loss(self.linear_model.parameters(), self.l2_reg_linear)
-
-        return loss
+    def _initialize_weights(self, init_std):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, nn.Linear):
+                m.weight.data.normal_(0, init_std)
+                if m.bias is not None:
+                    m.bias.data.zero_()
 
     def forward(self, X):
 
         sparse_embedding_list, dense_value_list = self.input_from_feature_columns(X, self.dnn_feature_columns,
-                                                                                  self.embedding_dict)
+                                                                                  self.embedding_dict, self.vector_embedding_dict)
 
         if self.use_lr:
-            linear_logit = self.linear_model(X)
+            linear_input = combined_dnn_input(sparse_embedding_list, dense_value_list)
+            linear_logit = self.linear_model(linear_input)
+
         if self.use_cin:
             cin_input = torch.cat(sparse_embedding_list, dim=1)
-            cin_output = self.cin(cin_input)
-            cin_logit = self.cin_linear(cin_output)
+            cin_result = self.cin(cin_input)
+            cin_logit = self.cin_linear(cin_result)
+
         if self.use_dnn:
             dnn_input = combined_dnn_input(sparse_embedding_list, dense_value_list)
             dnn_output = self.dnn(dnn_input)
             dnn_logit = self.dnn_linear(dnn_output)
 
-        if len(self.dnn_hidden_units) == 0 and self.use_lr == False:  # only cin
-            final_logit = cin_logit
-        elif len(self.dnn_hidden_units) == 0 and len(self.cin_layer_size) == 0:  # only linear
-            final_logit = linear_logit
-        elif len(self.dnn_hidden_units) == 0 and len(self.cin_layer_size) > 0:  # linear + CIN
-            final_logit = linear_logit + cin_logit
-        elif len(self.dnn_hidden_units) > 0 and len(self.cin_layer_size) == 0:  # linear +　Deep
-            final_logit = linear_logit + dnn_logit
-        elif len(self.dnn_hidden_units) > 0 and len(self.cin_layer_size) > 0:  # linear + CIN + Deep
-            final_logit = linear_logit + dnn_logit + cin_logit
-        else:
-            raise NotImplementedError
+        # if len(self.dnn_hidden_units) == 0 and self.use_lr == False:  # only cin
+        #     final_logit = cin_logit
+        # elif len(self.dnn_hidden_units) == 0 and len(self.cin_layer_size) == 0:  # only linear
+        #     final_logit = linear_logit
+        # elif len(self.dnn_hidden_units) == 0 and len(self.cin_layer_size) > 0:  # linear + CIN
+        #     final_logit = linear_logit + cin_logit
+        # elif len(self.dnn_hidden_units) > 0 and len(self.cin_layer_size) == 0:  # linear +　Deep
+        #     final_logit = linear_logit + dnn_logit
+        # elif len(self.dnn_hidden_units) > 0 and len(self.cin_layer_size) > 0:  # linear + CIN + Deep
+        #     final_logit = linear_logit + dnn_logit + cin_logit
+        # else:
+        #     raise NotImplementedError
+
+        final_logit = cin_logit
+        if self.use_dnn:
+            final_logit += dnn_logit
+        if self.use_lr:
+            final_logit += linear_logit
+
+        # final_logit = dnn_logit
 
         y_pred = self.out(final_logit)
 
         return y_pred
+

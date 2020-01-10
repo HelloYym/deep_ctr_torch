@@ -45,15 +45,13 @@ class DCN(BaseModel):
         super(DCN, self).__init__(linear_feature_columns=[],
                                   dnn_feature_columns=dnn_feature_columns,
                                   embedding_size=embedding_size,
-                                  dnn_hidden_units=dnn_hidden_units,
-                                  l2_reg_embedding=l2_reg_embedding, l2_reg_dnn=l2_reg_dnn, init_std=init_std,
-                                  seed=seed,
-                                  dnn_dropout=dnn_dropout, dnn_activation=dnn_activation,
                                   task=task, device=device)
         self.dnn_hidden_units = dnn_hidden_units
         self.cross_num = cross_num
-        self.dnn = DNN(self.compute_input_dim(dnn_feature_columns, embedding_size), dnn_hidden_units,
-                       activation=dnn_activation, use_bn=dnn_use_bn, l2_reg=l2_reg_dnn, dropout_rate=dnn_dropout,
+
+        if len(self.dnn_hidden_units) > 0:
+            self.dnn = DNN(self.compute_input_dim(dnn_feature_columns, embedding_size), dnn_hidden_units,
+                       activation=dnn_activation, use_bn=dnn_use_bn, dropout_rate=dnn_dropout,
                        init_std=init_std, device=device)
         if len(self.dnn_hidden_units) > 0 and self.cross_num > 0:
             dnn_linear_in_feature = self.compute_input_dim(dnn_feature_columns, embedding_size) + dnn_hidden_units[-1]
@@ -66,16 +64,12 @@ class DCN(BaseModel):
             device)
         self.crossnet = CrossNet(in_features=self.compute_input_dim(dnn_feature_columns, embedding_size),
                                  layer_num=cross_num, seed=1024, device=device)
-        self.add_regularization_loss(
-            filter(lambda x: 'weight' in x[0] and 'bn' not in x[0], self.dnn.named_parameters()), l2_reg_dnn)
-        self.add_regularization_loss(self.dnn_linear.weight, l2_reg_linear)
-        self.add_regularization_loss(self.crossnet.kernels, l2_reg_cross)
         self.to(device)
 
     def forward(self, X):
 
         sparse_embedding_list, dense_value_list = self.input_from_feature_columns(X, self.dnn_feature_columns,
-                                                                                  self.embedding_dict)
+                                                                                  self.embedding_dict, self.vector_embedding_dict)
 
         dnn_input = combined_dnn_input(sparse_embedding_list, dense_value_list)
 

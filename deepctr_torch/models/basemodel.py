@@ -20,9 +20,10 @@ from sklearn.metrics import *
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from ..inputs import build_input_features, SparseFeat, DenseFeat, VarLenSparseFeat
+from ..inputs import build_input_features, SparseFeat, DenseFeat, VectorFeat, VarLenSparseFeat
 from ..layers import PredictionLayer
 from ..layers.utils import slice_arrays
+from ..layers import DNN
 
 
 class Linear(nn.Module):
@@ -87,7 +88,7 @@ class Linear(nn.Module):
 class BaseModel(nn.Module):
     def __init__(self,
                  linear_feature_columns, dnn_feature_columns, embedding_size=8,
-                 l2_reg_embedding=1e-5, init_std=0.0001,
+                 init_std=0.0001,
                  task='binary', device='cpu'):
 
         super(BaseModel, self).__init__()
@@ -98,23 +99,36 @@ class BaseModel(nn.Module):
             linear_feature_columns + dnn_feature_columns)
         self.dnn_feature_columns = dnn_feature_columns
 
-        self.embedding_dict = self.create_embedding_matrix(dnn_feature_columns, embedding_size, init_std,
+        self.embedding_dict, self.vector_embedding_dict = self.create_embedding_matrix(dnn_feature_columns, embedding_size, init_std,
                                                            sparse=False)
 
-        self.l2_reg_embedding = l2_reg_embedding
+        self.best_auc = None
+        self.best_loss = None
 
         self.out = PredictionLayer(task, )
 
+
+
     def get_loss(self, y, y_pred):
 
-        loss = F.binary_cross_entropy(y_pred, y.squeeze())
+        return F.binary_cross_entropy(y_pred, y.squeeze())
 
-        embedding_loss = self.get_regularization_loss(
-            self.embedding_dict.parameters(), self.l2_reg_embedding)
-
-        return loss + embedding_loss
+        # embedding_loss = self.get_regularization_loss(
+        #     self.embedding_dict.parameters(), self.l2_reg_embedding)
 
     def reduce_lr(self, optimizer, epoch, factor=0.1, change_points=None):
+
+        # if epoch == 0:
+        #     for g in optimizer.param_groups:
+        #         g['lr'] = g['lr'] * 0.1
+        #         print(epoch, ": {0: .4f}".format(g['lr']))
+        #     return True
+        #
+        # elif epoch == 5:
+        #     for g in optimizer.param_groups:
+        #         g['lr'] = g['lr'] * 10
+        #         print(epoch, ": {0: .4f}".format(g['lr']))
+        #     return True
 
         if change_points is not None and epoch in change_points:
             for g in optimizer.param_groups:
@@ -126,6 +140,9 @@ class BaseModel(nn.Module):
             y=None,
             batch_size=4096,
             epochs=1,
+            lr=0.001,
+            change_points=(10,),
+            factor = 0.1,
             verbose=1,
             initial_epoch=0,
             validation_split=0.,
@@ -197,7 +214,7 @@ class BaseModel(nn.Module):
 
         val_tensor_data = Data.TensorDataset(torch.from_numpy(np.concatenate(val_x, axis=-1)), torch.from_numpy(val_y))
 
-        train_loader = DataLoader(dataset=train_tensor_data, shuffle=False, batch_size=batch_size,
+        train_loader = DataLoader(dataset=train_tensor_data, shuffle=shuffle, batch_size=batch_size,
                                   num_workers=8, pin_memory=False)
 
         val_loader = DataLoader(dataset=val_tensor_data, shuffle=False, batch_size=batch_size,
@@ -207,8 +224,7 @@ class BaseModel(nn.Module):
         model = nn.DataParallel(model, device_ids=[i for i in range(int(self.device.split(':')[1]), 8)])
 
         # 定义 优化方法
-        optim = torch.optim.Adam(model.parameters(), lr=0.04)
-        # optim = torch.optim.SGD(model.parameters(), lr=0.1)
+        optim = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.0001)
 
         metrics = self._get_metrics(metrics)
 
@@ -223,8 +239,8 @@ class BaseModel(nn.Module):
             total_loss_epoch = 0
             train_result = {}
 
-            change_points = [10, 20, 30, 40, 50]
-            self.reduce_lr(optim, epoch, factor=0.5, change_points=change_points)
+            change_points = change_points
+            self.reduce_lr(optim, epoch, factor=factor, change_points=change_points)
 
             model.train()
 
@@ -233,10 +249,21 @@ class BaseModel(nn.Module):
                 x = Variable(x_train.cuda(self.device).float())
                 y = Variable(y_train.cuda(self.device).float())
 
-                y_pred = model(x).squeeze()
+                out = model(x)
+                if len(out) == 2:
+                    y_pred, hidden_feature_maps = out
+                else:
+                    y_pred = out
+                    hidden_feature_maps = None
+
+                y_pred = y_pred.squeeze()
 
                 optim.zero_grad()
-                total_loss = self.get_loss(y, y_pred)
+
+                if len(out) == 2:
+                    total_loss = self.get_loss(y, y_pred, hidden_feature_maps)
+                else:
+                    total_loss = self.get_loss(y, y_pred)
 
                 total_loss_epoch += total_loss.item()
                 total_loss.backward(retain_graph=True)
@@ -270,6 +297,18 @@ class BaseModel(nn.Module):
                     for name, result in eval_result.items():
                         eval_str += " - val_" + name + \
                                     ": {0: .4f}".format(result)
+
+                        if name == 'logloss':
+                            if self.best_loss == None:
+                                self.best_loss = result
+                            elif result < self.best_loss:
+                                self.best_loss = result
+                        else:
+                            if self.best_auc == None:
+                                self.best_auc = result
+                            elif result > self.best_auc:
+                                self.best_auc= result
+
                 print(eval_str)
 
     def evaluate(self, model, val_loader, metrics):
@@ -290,6 +329,9 @@ class BaseModel(nn.Module):
                 y = Variable(y_test.cuda(self.device).float())
 
                 y_pred = model(x)
+                if len(y_pred) == 2:
+                    y_pred = y_pred[0]
+
                 pred_ans.append(y_pred)
 
                 for name, metric_fun in metrics.items():
@@ -301,6 +343,11 @@ class BaseModel(nn.Module):
             eval_result[key] = np.mean(eval_list)
 
         return eval_result
+
+    def print_best(self):
+        print('best auc: ', ": {0: .4f}".format(self.best_auc))
+        print('best loss: ', ": {0: .4f}".format(self.best_loss))
+
 
     def predict(self, x, batch_size=4096):
         """
@@ -334,12 +381,14 @@ class BaseModel(nn.Module):
 
         return np.concatenate(pred_ans)
 
-    def input_from_feature_columns(self, X, feature_columns, embedding_dict, support_dense=True):
+    def input_from_feature_columns(self, X, feature_columns, embedding_dict, vector_embedding_dict, support_dense=True):
 
         sparse_feature_columns = list(
             filter(lambda x: isinstance(x, SparseFeat), feature_columns)) if len(feature_columns) else []
         dense_feature_columns = list(
             filter(lambda x: isinstance(x, DenseFeat), feature_columns)) if len(feature_columns) else []
+        vector_feature_columns = list(
+            filter(lambda x: isinstance(x, VectorFeat), feature_columns)) if len(feature_columns) else []
 
         varlen_sparse_feature_columns = list(
             filter(lambda x: isinstance(x, VarLenSparseFeat), feature_columns)) if feature_columns else []
@@ -352,6 +401,10 @@ class BaseModel(nn.Module):
             X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]].long()) for
             feat in sparse_feature_columns]
 
+        vector_embedding_list = [vector_embedding_dict[feat.embedding_name](
+            X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]]).unsqueeze(1) for
+            feat in vector_feature_columns]
+
         varlen_sparse_embedding_list = [embedding_dict[feat.embedding_name](
             X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]].long()) for
             feat in varlen_sparse_feature_columns]
@@ -362,7 +415,7 @@ class BaseModel(nn.Module):
         dense_value_list = [X[:, self.feature_index[feat.name][0]:self.feature_index[feat.name][1]] for feat in
                             dense_feature_columns]
 
-        return sparse_embedding_list + varlen_sparse_embedding_list, dense_value_list
+        return sparse_embedding_list + vector_embedding_list + varlen_sparse_embedding_list, dense_value_list
 
     def create_embedding_matrix(self, feature_columns, embedding_size, init_std=0.0001, sparse=False):
 
@@ -372,9 +425,17 @@ class BaseModel(nn.Module):
         varlen_sparse_feature_columns = list(
             filter(lambda x: isinstance(x, VarLenSparseFeat), feature_columns)) if len(feature_columns) else []
 
+        vector_feature_columns = list(
+            filter(lambda x: isinstance(x, VectorFeat), feature_columns)) if len(feature_columns) else []
+
         embedding_dict = nn.ModuleDict(
             {feat.embedding_name: nn.Embedding(feat.dimension, embedding_size, sparse=sparse) for feat in
              sparse_feature_columns}
+        )
+
+        vector_embedding_dict = nn.ModuleDict(
+            {feat.embedding_name: DNN(feat.dimension, (embedding_size,), activation=F.relu, init_std=init_std) for feat in
+             vector_feature_columns}
         )
 
         for feat in varlen_sparse_feature_columns:
@@ -384,15 +445,17 @@ class BaseModel(nn.Module):
         for tensor in embedding_dict.values():
             nn.init.normal_(tensor.weight, mean=0, std=init_std)
 
-        return embedding_dict
+        return embedding_dict, vector_embedding_dict
 
-    def compute_input_dim(self, feature_columns, embedding_size=1, include_sparse=True, include_dense=True,
+    def compute_input_dim(self, feature_columns, embedding_size=1, include_sparse=True, include_dense=True, include_vector=True,
                           feature_group=False):
         sparse_feature_columns = list(
             filter(lambda x: isinstance(x, (SparseFeat, VarLenSparseFeat)), feature_columns)) if len(
             feature_columns) else []
         dense_feature_columns = list(
             filter(lambda x: isinstance(x, DenseFeat), feature_columns)) if len(feature_columns) else []
+        vector_feature_columns = list(
+            filter(lambda x: isinstance(x, VectorFeat), feature_columns)) if len(feature_columns) else []
 
         dense_input_dim = sum(
             map(lambda x: x.dimension, dense_feature_columns))
@@ -400,24 +463,15 @@ class BaseModel(nn.Module):
             sparse_input_dim = len(sparse_feature_columns)
         else:
             sparse_input_dim = len(sparse_feature_columns) * embedding_size
+        vector_input_dim = len(vector_feature_columns) * embedding_size
         input_dim = 0
         if include_sparse:
             input_dim += sparse_input_dim
         if include_dense:
             input_dim += dense_input_dim
+        if include_vector:
+            input_dim += vector_input_dim
         return input_dim
-
-    def get_regularization_loss(self, weight_list, weight_decay, p=2):
-        reg_loss = torch.zeros((1,)).cuda(self.device)
-        for w in weight_list:
-            if isinstance(w, tuple):
-                l2_reg = torch.norm(w[1], p=p, )
-            else:
-                l2_reg = torch.norm(w, p=p, )
-            reg_loss = reg_loss + l2_reg.cuda(self.device)
-        reg_loss = weight_decay * reg_loss
-
-        return reg_loss
 
     def _get_metrics(self, metrics):
         metrics_ = {}

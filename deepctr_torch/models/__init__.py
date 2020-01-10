@@ -10,4 +10,6 @@ from .mlr import MLR
 from .onn import ONN
 from .pnn import PNN
 from .ccpm import CCPM
+from .fideepfm import FiDeepFM
+from .fm import PureFM
 NFFM = ONN

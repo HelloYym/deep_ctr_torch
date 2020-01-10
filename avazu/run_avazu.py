@@ -20,11 +20,11 @@ if __name__ == "__main__":
     print(data.shape)
     print(data.head())
 
-    sparse_features = ['C' + str(i) for i in range(1, 27)]
-    dense_features = ['I' + str(i) for i in range(1, 14)]
-    features = sparse_features + dense_features
+    features = ['C' + str(i) for i in range(14, 22)]
+    features += ['C1', 'hour', 'banner_pos', 'site_id', 'site_domain', 'site_category', 'app_id', 'app_domain', 'app_category',
+                        'device_id', 'device_ip', 'device_model', 'device_type', 'device_conn_type']
 
-    target = ['label']
+    target = ['click']
 
     fixlen_feature_columns = [SparseFeat(feat, data[feat].nunique()) for feat in features]
 
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     #                embedding_size=10, use_fm=True,
     #                dnn_hidden_units=(100, 100),
     #                l2_reg_linear=0.0001, l2_reg_embedding=0.0001, l2_reg_dnn=0, init_std=0.0001, seed=1024,
-    #                dnn_dropout=0.05,
+    #                dnn_dropout=0.02,
     #                dnn_activation=F.relu, dnn_use_bn=True, task='binary', device=device)
 
     # model = DCN(dnn_feature_columns=dnn_feature_columns,
@@ -65,42 +65,42 @@ if __name__ == "__main__":
     #             cross_num=2,
     #             dnn_hidden_units=(100, 100),
     #             l2_reg_linear=0.0001, l2_reg_embedding=0.0001, l2_reg_dnn=0, init_std=0.0001, seed=1024,
-    #             dnn_dropout=0.05,
+    #             dnn_dropout=0.02,
     #             dnn_activation=F.relu, dnn_use_bn=True, task='binary', device=device)
 
     model = FiDeepFM(linear_feature_columns=linear_feature_columns, dnn_feature_columns=dnn_feature_columns,
                     task='binary',
                     embedding_size=10,
                     dnn_hidden_units=(),
-                    cin_layer_size=(40,40,40,40), cin_split_half=False,
+                    cin_layer_size=(40, 40, 40, 40), cin_split_half=False,
                     cin_activation=F.relu,
                     cin_flatten=True,
                     use_senet=True,
-                    use_cosine_loss=0,
-                    init_std=0.0001, seed=1024, dnn_dropout=0.02,
+                    use_cosine_loss=0.01,
+                    init_std=0.0001, seed=1024, dnn_dropout=0.05,
                     dnn_activation=F.relu, dnn_use_bn=True,
                     device=device)
-    #
+
     # model = xDeepFM(linear_feature_columns=linear_feature_columns, dnn_feature_columns=dnn_feature_columns,
     #                 task='binary',
     #                 embedding_size=10,
     #                 use_lr=False,
     #                 dnn_hidden_units=(),
     #                 cin_layer_size=(40, 40, 40, 40), cin_split_half=False, cin_activation=F.relu,
-    #                 init_std=0.0001, seed=1024, dnn_dropout=0.05,
+    #                 init_std=0.0001, seed=1024, dnn_dropout=0.02,
     #                 dnn_activation=F.relu, dnn_use_bn=True,
     #                 device=device)
 
     model.fit(train_model_input, train[target].values,
               batch_size=4096 * 16,
-              epochs=25,
+              epochs=30,
               lr=0.01,
               change_points=[5, 15],
               factor=0.1,
               validation_data=[test_model_input, test[target].values],
               metrics=["logloss", "auc"],
               shuffle=True,
-              verbose=1)
+              verbose=2)
 
     model.print_best()
 

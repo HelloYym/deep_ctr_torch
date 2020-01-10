@@ -30,14 +30,13 @@ class DNN(nn.Module):
         - **seed**: A Python integer to use as random seed.
     """
 
-    def __init__(self, inputs_dim, hidden_units, activation=F.relu, l2_reg=0, dropout_rate=0, use_bn=False,
+    def __init__(self, inputs_dim, hidden_units, activation=F.relu, dropout_rate=0, use_bn=False,
                  init_std=0.0001, seed=1024, device='cpu'):
         super(DNN, self).__init__()
         self.activation = activation
         self.dropout_rate = dropout_rate
         self.dropout = nn.Dropout(dropout_rate)
         self.seed = seed
-        self.l2_reg = l2_reg
         self.use_bn = use_bn
         if len(hidden_units) == 0:
             raise ValueError("hidden_units is empty!!")

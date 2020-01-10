@@ -20,6 +20,13 @@ class SparseFeat(namedtuple('SparseFeat', ['name', 'dimension', 'use_hash', 'dty
             embedding_name = name
         return super(SparseFeat, cls).__new__(cls, name, dimension, use_hash, dtype, embedding_name, embedding)
 
+class VectorFeat(namedtuple('VectorFeat', ['name', 'dimension', 'dtype', 'embedding_name', 'embedding'])):
+    __slots__ = ()
+
+    def __new__(cls, name, dimension, dtype="int32", embedding_name=None, embedding=True):
+        if embedding and embedding_name is None:
+            embedding_name = name
+        return super(VectorFeat, cls).__new__(cls, name, dimension, dtype, embedding_name, embedding)
 
 class DenseFeat(namedtuple('DenseFeat', ['name', 'dimension', 'dtype'])):
     __slots__ = ()
@@ -60,6 +67,9 @@ def build_input_features(feature_columns):
         if isinstance(feat, SparseFeat):
             features[feat_name] = (start, start + 1)
             start += 1
+        elif isinstance(feat, VectorFeat):
+            features[feat_name] = (start, start + feat.dimension)
+            start += feat.dimension
         elif isinstance(feat, DenseFeat):
             features[feat_name] = (start, start + feat.dimension)
             start += feat.dimension
